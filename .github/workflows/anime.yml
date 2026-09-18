@@ -1,0 +1,98 @@
+name: Video to Anime - Single File
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'ভিডিওর ডাইরেক্ট / YouTube লিংক'
+        required: true
+        type: string
+      style:
+        description: 'Style'
+        required: true
+        default: 'Paprika'
+        type: choice
+        options:
+          - Paprika
+          - Hayao
+          - Shinkai
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg wget
+          pip install opencv-python onnxruntime numpy yt-dlp
+
+      - name: Download Video
+        run: |
+          yt-dlp -o "input.mp4" --merge-output-format mp4 "${{ inputs.video_url }}" || wget -O input.mp4 "${{ inputs.video_url }}"
+          ls -lh input.mp4
+
+      - name: Split into 5min Parts
+        run: |
+          mkdir -p parts anime_parts
+          ffmpeg -i input.mp4 -c:v libx264 -c:a aac -map 0 -segment_time 300 -f segment -reset_timestamps 1 -g 30 parts/part_%03d.mp4
+          ls -lh parts/
+
+      - name: Download Model
+        run: |
+          if [ "${{ inputs.style }}" == "Paprika" ]; then
+            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Paprika.onnx
+          elif [ "${{ inputs.style }}" == "Hayao" ]; then
+            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Hayao.onnx
+          else
+            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Shinkai.onnx
+          fi
+
+      - name: Create Release
+        run: |
+          TAG="anime-${{ github.run_number }}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          gh release create "$TAG" --title "Anime $TAG - ${{ inputs.style }}" --notes "Original: ${{ inputs.video_url }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Convert and Upload One by One
+        run: |
+          # Python স্ক্রিপ্টটা এখানেই বানিয়ে নিচ্ছি, আলাদা ফাইল লাগবে না
+          cat > convert.py << 'PY'
+          import cv2, onnxruntime as ort, numpy as np, sys
+          sess = ort.InferenceSession("model.onnx", providers=['CPUExecutionProvider'])
+          inp, outp = sys.argv[1], sys.argv[2]
+          cap = cv2.VideoCapture(inp)
+          fps = cap.get(cv2.CAP_PROP_FPS) or 24
+          out = cv2.VideoWriter(outp, cv2.VideoWriter_fourcc(*'mp4v'), fps, (1280, 720))
+          while True:
+              ret, frame = cap.read()
+              if not ret: break
+              img = cv2.resize(frame, (1280, 720)).astype(np.float32) / 127.5 - 1.0
+              img = np.transpose(img, (2, 0, 1))[None]
+              res = sess.run(None, {sess.get_inputs()[0].name: img})[0][0].transpose(1,2,0)
+              res = np.clip((res + 1) / 2 * 255, 0, 255).astype(np.uint8)
+              out.write(res)
+          cap.release(); out.release()
+          print(f"Done {outp}")
+          PY
+
+          for f in parts/*.mp4; do
+            base=$(basename "$f".mp4)
+            out_file="anime_parts/${base}_anime.mp4"
+            echo "Converting $f"
+            python convert.py "$f" "$out_file"
+            echo "Uploading $out_file"
+            gh release upload "$TAG" "$out_file" --clobber
+            rm "$f"
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
