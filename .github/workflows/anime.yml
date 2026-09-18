@@ -16,6 +16,15 @@ on:
           - Paprika
           - Hayao
           - Shinkai
+      infer_size:
+        description: 'Model processing size (smaller = much faster). Output is always 1280x720'
+        required: false
+        default: '1280x720'
+        type: choice
+        options:
+          - 1280x720
+          - 960x540
+          - 640x360
 
 permissions:
   contents: write
@@ -31,8 +40,8 @@ jobs:
 
       - name: Install Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg wget
-          pip install opencv-python onnxruntime numpy yt-dlp
+          sudo apt-get update && sudo apt-get install -y ffmpeg wget curl
+          pip install opencv-python-headless onnxruntime numpy yt-dlp
 
       - name: Download Video
         run: |
@@ -47,13 +56,29 @@ jobs:
 
       - name: Download Model
         run: |
-          if [ "${{ inputs.style }}" == "Paprika" ]; then
-            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Paprika.onnx
-          elif [ "${{ inputs.style }}" == "Hayao" ]; then
-            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Hayao.onnx
-          else
-            wget -O model.onnx https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/1.0.0/AnimeGANv3_Shinkai.onnx
+          # AnimeGANv3 never released a Paprika model (and the 1.0.0 release path doesn't exist),
+          # so all three styles come from AnimeGANv2 ONNX models hosted on Hugging Face.
+          REPO="vumichien/AnimeGANv2_${{ inputs.style }}"
+
+          # Ask the Hugging Face API for the real .onnx filename instead of hard-coding it
+          FILE=$(curl -sfL "https://huggingface.co/api/models/${REPO}" | python -c "import sys,json; print(next(s['rfilename'] for s in json.load(sys.stdin)['siblings'] if s['rfilename'].endswith('.onnx')))")
+          echo "Model file: $FILE"
+
+          wget --tries=3 -O model.onnx "https://huggingface.co/${REPO}/resolve/main/${FILE}"
+          ls -lh model.onnx
+
+          # Fail early if the download is empty / an error page instead of a real model
+          SIZE=$(stat -c%s model.onnx)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "Model download looks wrong (only $SIZE bytes)"; exit 1
           fi
+
+          python -c "
+          import onnxruntime as ort
+          s = ort.InferenceSession('model.onnx', providers=['CPUExecutionProvider'])
+          print('INPUT :', s.get_inputs()[0].name, s.get_inputs()[0].shape)
+          print('OUTPUT:', s.get_outputs()[0].name, s.get_outputs()[0].shape)
+          "
 
       - name: Create Release
         run: |
@@ -67,32 +92,70 @@ jobs:
         run: |
           # Python স্ক্রিপ্টটা এখানেই বানিয়ে নিচ্ছি, আলাদা ফাইল লাগবে না
           cat > convert.py << 'PY'
-          import cv2, onnxruntime as ort, numpy as np, sys
+          import os, sys
+          import cv2, onnxruntime as ort, numpy as np
+
           sess = ort.InferenceSession("model.onnx", providers=['CPUExecutionProvider'])
           inp, outp = sys.argv[1], sys.argv[2]
+
+          OUT_W, OUT_H = 1280, 720
+          INF_W, INF_H = [int(v) for v in os.environ.get("INFER_SIZE", "1280x720").split("x")]
+          # AnimeGAN needs width/height to be multiples of 32
+          INF_W, INF_H = max(32, INF_W // 32 * 32), max(32, INF_H // 32 * 32)
+
+          meta = sess.get_inputs()[0]
+          shape = meta.shape
+          # AnimeGANv2 ONNX (from TensorFlow) is NHWC [1,H,W,3]; some others are NCHW [1,3,H,W]
+          nchw = len(shape) == 4 and shape[1] == 3 and shape[3] != 3
+          h_dim, w_dim = (shape[2], shape[3]) if nchw else (shape[1], shape[2])
+          if isinstance(h_dim, int) and isinstance(w_dim, int):
+              INF_H, INF_W = h_dim, w_dim  # model has a fixed input size
+          print(f"input={shape} layout={'NCHW' if nchw else 'NHWC'} infer={INF_W}x{INF_H}")
+
           cap = cv2.VideoCapture(inp)
           fps = cap.get(cv2.CAP_PROP_FPS) or 24
-          out = cv2.VideoWriter(outp, cv2.VideoWriter_fourcc(*'mp4v'), fps, (1280, 720))
+          out = cv2.VideoWriter(outp, cv2.VideoWriter_fourcc(*'mp4v'), fps, (OUT_W, OUT_H))
+          if not out.isOpened():
+              sys.exit("Could not open video writer")
+
+          n = 0
           while True:
               ret, frame = cap.read()
               if not ret: break
-              img = cv2.resize(frame, (1280, 720)).astype(np.float32) / 127.5 - 1.0
-              img = np.transpose(img, (2, 0, 1))[None]
-              res = sess.run(None, {sess.get_inputs()[0].name: img})[0][0].transpose(1,2,0)
+              # OpenCV is BGR, the model expects RGB
+              img = cv2.cvtColor(cv2.resize(frame, (INF_W, INF_H)), cv2.COLOR_BGR2RGB)
+              img = img.astype(np.float32) / 127.5 - 1.0
+              img = np.transpose(img, (2, 0, 1))[None] if nchw else img[None]
+              res = sess.run(None, {meta.name: img})[0][0]
+              if res.shape[0] == 3 and res.shape[-1] != 3:  # NCHW output -> HWC
+                  res = res.transpose(1, 2, 0)
               res = np.clip((res + 1) / 2 * 255, 0, 255).astype(np.uint8)
+              res = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
+              if res.shape[1] != OUT_W or res.shape[0] != OUT_H:
+                  res = cv2.resize(res, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
               out.write(res)
+              n += 1
+              if n % 500 == 0: print(f"  {n} frames", flush=True)
           cap.release(); out.release()
-          print(f"Done {outp}")
+          print(f"Done {outp} ({n} frames)")
           PY
 
           for f in parts/*.mp4; do
-            base=$(basename "$f".mp4)
+            base=$(basename "$f" .mp4)
+            raw_file="anime_parts/${base}_raw.mp4"
             out_file="anime_parts/${base}_anime.mp4"
             echo "Converting $f"
-            python convert.py "$f" "$out_file"
+            python convert.py "$f" "$raw_file"
+
+            # Put the original audio back and re-encode to H.264 so it plays everywhere
+            ffmpeg -y -i "$raw_file" -i "$f" -map 0:v:0 -map 1:a:0? \
+              -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a copy -shortest "$out_file"
+            rm "$raw_file"
+
             echo "Uploading $out_file"
             gh release upload "$TAG" "$out_file" --clobber
             rm "$f"
           done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INFER_SIZE: ${{ inputs.infer_size }}
